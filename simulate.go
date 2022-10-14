@@ -47,13 +47,13 @@ func RunSimulation() error {
 
 	// one pass to grab any updated elos
 	for _, game := range season {
-		if game.AwayELO > 0 {
+		if game.AwayELOPost > 0 {
 			fmt.Printf("Updating ELO for %s from game %d\n", game.AwayTeam, game.GamePK)
-			elos[game.AwayTeam] = game.AwayELO
+			elos[game.AwayTeam] = game.AwayELOPost
 		}
-		if game.HomeELO > 0 {
+		if game.HomeELOPost > 0 {
 			fmt.Printf("Updating ELO for %s from game %d\n", game.AwayTeam, game.GamePK)
-			elos[game.HomeTeam] = game.HomeELO
+			elos[game.HomeTeam] = game.HomeELOPost
 		}
 	}
 
@@ -65,7 +65,7 @@ func RunSimulation() error {
 	start := time.Now()
 
 	for i := 0; i < numRuns; i++ {
-		simulatedSeason := SimulateSeason(&elos, &season)
+		simulatedSeason := SimulateSeason(&elos, &season, &teams)
 		simulatedStandings := CalculateStandings(&teams, &simulatedSeason)
 		for _, divisionStandings := range simulatedStandings.DivisionSeeds {
 			for i, team := range divisionStandings {
@@ -110,7 +110,7 @@ func RunSimulation() error {
 	return nil
 }
 
-func SimulateSeason(baseElos *map[string]float64, baseSeason *[]NHLGameCSVRow) []NHLGameCSVRow {
+func SimulateSeason(baseElos *map[string]float64, baseSeason *[]NHLGameCSVRow, teams *map[string]NHLTeamJSON) []NHLGameCSVRow {
 	// copy the elo map so we can keep it updated for this simulation
 	seasonElos := make(map[string]float64)
 	for team, elo := range *baseElos {
@@ -124,17 +124,21 @@ func SimulateSeason(baseElos *map[string]float64, baseSeason *[]NHLGameCSVRow) [
 			continue
 		}
 
-		seasonGames = append(seasonGames, SimulateGame(game, seasonElos))
+		seasonGames = append(seasonGames, SimulateGame(game, seasonElos, teams))
 	}
 
 	return seasonGames
 }
 
-func SimulateGame(game NHLGameCSVRow, elos map[string]float64) NHLGameCSVRow {
+func SimulateGame(game NHLGameCSVRow, elos map[string]float64, teams *map[string]NHLTeamJSON) NHLGameCSVRow {
 	simulatedGame := game
 	simulatedGame.Status = "Simulated"
 
-	homeElo := elos[game.HomeTeam] + 50 // 50 points for home ice advantage
+	homeElo := elos[game.HomeTeam]
+	if (*teams)[game.HomeTeam].Venue.Name == game.Venue {
+		// 50 points for home ice advantage
+		homeElo += 50
+	}
 	awayElo := elos[game.AwayTeam]
 	eloDiff := homeElo - awayElo
 	/*if game.IsPlayoff == 1 {
@@ -186,41 +190,11 @@ func SimulateGame(game NHLGameCSVRow, elos map[string]float64) NHLGameCSVRow {
 		simulatedGame.IsShootout = 1
 	}
 
-	var winnerEloDiff float64
-	if isHomeWin {
-		winnerEloDiff = eloDiff
-	} else {
-		winnerEloDiff = -eloDiff
-	}
-
-	marginOfVictoryMultiplier := (0.6686 * math.Log(float64(goalDiff))) + 0.8048
-	autocorrelationAdjustment := 2.05 / ((winnerEloDiff * 0.001) + 2.05)
-
-	var teamWin float64
-	var teamWinProb float64
-	var homeTeamFavorite bool
-	if homeWinPct < 0.5 {
-		// away favorite
-		homeTeamFavorite = false
-		if !isHomeWin {
-			teamWin = 1.0
-		}
-		teamWinProb = 1.0 - homeWinPct
-	} else {
-		// home favorite
-		homeTeamFavorite = true
-		if isHomeWin {
-			teamWin = 1.0
-		}
-		teamWinProb = homeWinPct
-	}
-	pregameFavoriteMultiplier := teamWin - teamWinProb
-
-	shift := 6.0 * marginOfVictoryMultiplier * autocorrelationAdjustment * pregameFavoriteMultiplier
+	shift := CalculateEloShift(eloDiff, homeWinPct, &simulatedGame)
 
 	//fmt.Printf("  shift: %f (mov: %f, aca: %f, pgf: %f)\n", shift, marginOfVictoryMultiplier, autocorrelationAdjustment, pregameFavoriteMultiplier)
 
-	if homeTeamFavorite {
+	if isHomeWin {
 		elos[game.HomeTeam] += shift
 		elos[game.AwayTeam] -= shift
 	} else {
@@ -231,6 +205,40 @@ func SimulateGame(game NHLGameCSVRow, elos map[string]float64) NHLGameCSVRow {
 	//fmt.Printf("  new elos: %s: %f, %s: %f\n", game.HomeTeam, elos[game.HomeTeam], game.AwayTeam, elos[game.AwayTeam])
 
 	return simulatedGame
+}
+
+func CalculateEloShift(eloDiff float64, homeWinPct float64, game *NHLGameCSVRow) float64 {
+	var winnerEloDiff float64
+	var goalDiff int
+	if game.HomeScore > game.AwayScore {
+		winnerEloDiff = eloDiff
+		goalDiff = game.HomeScore - game.AwayScore
+	} else {
+		winnerEloDiff = -eloDiff
+		goalDiff = game.AwayScore - game.HomeScore
+	}
+
+	marginOfVictoryMultiplier := (0.6686 * math.Log(float64(goalDiff))) + 0.8048
+	autocorrelationAdjustment := 2.05 / ((winnerEloDiff * 0.001) + 2.05)
+
+	var teamWin float64
+	var teamWinProb float64
+	if homeWinPct < 0.5 {
+		// away favorite
+		if game.HomeScore < game.AwayScore {
+			teamWin = 1.0
+		}
+		teamWinProb = 1.0 - homeWinPct
+	} else {
+		// home favorite
+		if game.HomeScore > game.AwayScore {
+			teamWin = 1.0
+		}
+		teamWinProb = homeWinPct
+	}
+	pregameFavoriteMultiplier := teamWin - teamWinProb
+
+	return 6.0 * marginOfVictoryMultiplier * autocorrelationAdjustment * pregameFavoriteMultiplier
 }
 
 type NHLSeasonStats struct {

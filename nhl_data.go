@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 
@@ -35,6 +36,9 @@ type NHLGameJSON struct {
 	Linescore struct {
 		CurrentPeriodOrdinal string `json:"currentPeriodOrdinal"`
 	} `json:"linescore"`
+	Venue struct {
+		Name string `json:"name"`
+	} `json:"venue"`
 }
 
 type NHLGameTeamJSON struct {
@@ -80,6 +84,9 @@ type NHLTeamJSON struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"conference"`
+	Venue struct {
+		Name string `json:"name"`
+	} `json:"venue"`
 }
 
 func GetNHLTeams() (map[string]NHLTeamJSON, error) {
@@ -108,17 +115,20 @@ func GetNHLTeams() (map[string]NHLTeamJSON, error) {
 }
 
 type NHLGameCSVRow struct {
-	GamePK     int64   `csv:"game_pk"`
-	Date       string  `csv:"date"`
-	IsOT       int     `csv:"ot"`
-	IsShootout int     `csv:"shootout"`
-	Status     string  `csv:"status"`
-	HomeTeam   string  `csv:"home_team"`
-	HomeScore  int     `csv:"home_score"`
-	HomeELO    float64 `csv:"home_elo"`
-	AwayTeam   string  `csv:"away_team"`
-	AwayScore  int     `csv:"away_score"`
-	AwayELO    float64 `csv:"away_elo"`
+	GamePK      int64   `csv:"game_pk"`
+	Date        string  `csv:"date"`
+	Venue       string  `csv:"venue"`
+	IsOT        int     `csv:"ot"`
+	IsShootout  int     `csv:"shootout"`
+	Status      string  `csv:"status"`
+	HomeTeam    string  `csv:"home_team"`
+	HomeScore   int     `csv:"home_score"`
+	HomeELOPre  float64 `csv:"home_elo_pre"`
+	HomeELOPost float64 `csv:"home_elo_post"`
+	AwayTeam    string  `csv:"away_team"`
+	AwayScore   int     `csv:"away_score"`
+	AwayELOPre  float64 `csv:"away_elo_pre"`
+	AwayELOPost float64 `csv:"away_elo_pre"`
 }
 
 func UpdateNHLSeason() error {
@@ -137,7 +147,11 @@ func UpdateNHLSeason() error {
 		teamsByID[team.ID] = team
 	}
 
-	// TODO: write ELOs
+	elos, err := LoadPreseasonElos()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("loaded %d elos\n", len(elos))
 
 	gameRows := []NHLGameCSVRow{}
 	for _, date := range season.Dates {
@@ -158,17 +172,53 @@ func UpdateNHLSeason() error {
 				isShootout = 1
 			}
 
-			gameRows = append(gameRows, NHLGameCSVRow{
+			homeTeam := teamsByID[game.Teams.Home.Team.ID].Abbreviation
+			awayTeam := teamsByID[game.Teams.Away.Team.ID].Abbreviation
+			gameRow := NHLGameCSVRow{
 				GamePK:     game.GamePK,
 				Date:       date.Date,
 				Status:     game.Status.AbstractGameState,
-				HomeTeam:   teamsByID[game.Teams.Home.Team.ID].Abbreviation,
+				Venue:      game.Venue.Name,
+				HomeTeam:   homeTeam,
 				HomeScore:  game.Teams.Home.Score,
-				AwayTeam:   teamsByID[game.Teams.Away.Team.ID].Abbreviation,
+				AwayTeam:   awayTeam,
 				AwayScore:  game.Teams.Away.Score,
 				IsOT:       isOT,
 				IsShootout: isShootout,
-			})
+			}
+
+			if game.Status.AbstractGameState == "Final" {
+				homeELOPre := elos[homeTeam]
+				awayELOPre := elos[awayTeam]
+
+				eloDiff := homeELOPre - awayELOPre
+
+				if game.Venue.Name == teams[homeTeam].Venue.Name {
+					// 50 points for home ice advantage
+					eloDiff += 50
+				}
+
+				homeWinPct := 1.0 / (math.Pow(10, -eloDiff/400.0) + 1)
+				shift := CalculateEloShift(eloDiff, homeWinPct, &gameRow)
+
+				gameRow.HomeELOPre = homeELOPre
+				gameRow.AwayELOPre = awayELOPre
+
+				var homeELO, awayELO float64
+				if gameRow.HomeScore > gameRow.AwayScore {
+					homeELO = homeELOPre + shift
+					awayELO = awayELOPre - shift
+				} else {
+					homeELO = homeELOPre - shift
+					awayELO = awayELOPre + shift
+				}
+				gameRow.HomeELOPost = homeELO
+				gameRow.AwayELOPost = awayELO
+				elos[homeTeam] = homeELO
+				elos[awayTeam] = awayELO
+			}
+
+			gameRows = append(gameRows, gameRow)
 		}
 	}
 
